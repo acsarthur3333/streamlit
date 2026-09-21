@@ -22,7 +22,16 @@ from collections.abc import Callable, Container, Iterator, Sequence
 from copy import deepcopy
 from enum import Enum, auto
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Final, NoReturn, Protocol, TypeVar, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    NoReturn,
+    Protocol,
+    TypeVar,
+    cast,
+    overload,
+)
 
 from streamlit.error_util import handle_user_script_exception
 from streamlit.errors import (
@@ -89,7 +98,10 @@ Fragment = Callable[[], Any]
 class _FragmentLifetime(Enum):
     """The rerun boundary that can remove a fragment."""
 
+    # Removed when its parent executes without re-registering it, or when its
+    # parent is itself removed.
     PARENT_SCOPED = auto()
+    # Retained across fragment reruns and removed only by full-app cleanup.
     FULL_APP_SCOPED = auto()
 
 
@@ -171,12 +183,11 @@ class FragmentStorage(Protocol):
         root_fragment_id: str,
         newly_registered_ids: frozenset[str],
     ) -> list[str]:
-        """Remove stored fragments that are strict descendants of ``root_fragment_id``
-        but were not re-registered during the latest run of that root.
+        """Remove stale parent-scoped descendants of ``root_fragment_id``.
 
-        Used after a fragment-only rerun so orphaned nested fragments (e.g. from a
-        removed ``run_every`` child) do not keep stale closures in storage. Returns
-        the list of removed fragment IDs.
+        A missing fragment is stale when its parent executed or was also removed.
+        A retained full-app-scoped fragment stops removal from propagating into its
+        previously registered subtree.
         """
         raise NotImplementedError
 
@@ -267,7 +278,7 @@ class MemoryFragmentStorage(FragmentStorage):
 
     MemoryFragmentStorage is just a wrapper around a plain Python dict that complies with
     the FragmentStorage protocol. A single lock guards the fragment closures plus the
-    ancestry and registration metadata that need to stay in sync with them.
+    ancestry, lifetime, and registration metadata that need to stay in sync with them.
     """
 
     def __init__(self) -> None:
@@ -275,6 +286,7 @@ class MemoryFragmentStorage(FragmentStorage):
         self._fragments: dict[str, Fragment] = {}
         # Enclosing fragment id for nested fragments; top-level fragments use None.
         self._parent_by_id: dict[str, str | None] = {}
+        # Rerun boundary that may remove each fragment.
         self._lifetime_by_id: dict[str, _FragmentLifetime] = {}
         self._registration_sequence_by_id: dict[str, int] = {}
         self._registration_sequence = 0
@@ -398,27 +410,70 @@ class MemoryFragmentStorage(FragmentStorage):
         root_fragment_id: str,
         newly_registered_ids: frozenset[str],
     ) -> list[str]:
-        """Drop descendant fragments under ``root_fragment_id`` not seen this run.
-
-        Returns the list of fragment IDs that were removed so the caller can, for
-        example, tell the frontend to cancel their auto-rerun timers.
-        """
+        """Drop stale parent-scoped descendants under ``root_fragment_id``."""
 
         with self._lock:
-            to_remove = [
+            stale_candidates = [
                 fragment_id
                 for fragment_id in self._fragments
                 if fragment_id != root_fragment_id
                 and fragment_id not in newly_registered_ids
-                and self._lifetime_by_id.get(
-                    fragment_id, _FragmentLifetime.PARENT_SCOPED
-                )
-                is _FragmentLifetime.PARENT_SCOPED
                 and root_fragment_id in self._iter_ancestor_ids(fragment_id)
+            ]
+
+            fragments_to_remove: set[str] = set()
+            while True:
+                newly_stale = {
+                    fragment_id
+                    for fragment_id in stale_candidates
+                    if fragment_id not in fragments_to_remove
+                    and self._should_remove_stale_fragment(
+                        fragment_id,
+                        root_fragment_id=root_fragment_id,
+                        newly_registered_ids=newly_registered_ids,
+                        fragments_to_remove=fragments_to_remove,
+                    )
+                }
+                if not newly_stale:
+                    break
+                fragments_to_remove.update(newly_stale)
+
+            to_remove = [
+                fragment_id
+                for fragment_id in stale_candidates
+                if fragment_id in fragments_to_remove
             ]
             for fragment_id in to_remove:
                 self._remove(fragment_id)
             return to_remove
+
+    def _should_remove_stale_fragment(
+        self,
+        fragment_id: str,
+        *,
+        root_fragment_id: str,
+        newly_registered_ids: frozenset[str],
+        fragments_to_remove: Container[str],
+    ) -> bool:
+        """Return whether a missing fragment is stale in this root execution."""
+        if fragment_id in newly_registered_ids:
+            return False
+
+        if (
+            self._lifetime_by_id.get(fragment_id, _FragmentLifetime.PARENT_SCOPED)
+            is _FragmentLifetime.FULL_APP_SCOPED
+        ):
+            return False
+
+        parent_fragment_id = self._parent_by_id.get(fragment_id)
+        if parent_fragment_id is None:
+            return False
+
+        return (
+            parent_fragment_id == root_fragment_id
+            or parent_fragment_id in newly_registered_ids
+            or parent_fragment_id in fragments_to_remove
+        )
 
     def registration_sequence(self) -> int:
         with self._lock:
@@ -598,11 +653,16 @@ def _fragment(
     if func is None:
         # Support passing the params via function decorator
         def wrapper(f: F) -> F:
-            return fragment(
-                func=f,
-                run_every=run_every,
-                parallel=parallel,
-                key=key,
+            return cast(
+                "F",
+                _fragment(
+                    func=f,
+                    run_every=run_every,
+                    parallel=parallel,
+                    key=key,
+                    additional_hash_info=additional_hash_info,
+                    lifetime=lifetime,
+                ),
             )
 
         return wrapper
