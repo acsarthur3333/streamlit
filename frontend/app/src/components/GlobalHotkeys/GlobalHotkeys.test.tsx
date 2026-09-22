@@ -74,6 +74,23 @@ describe("GlobalHotkeys", () => {
     expect(onKeyDown).not.toHaveBeenCalled()
   })
 
+  it("ignores keyboard events without a key", () => {
+    const onKeyDown = vi.fn()
+    const onKeyUp = vi.fn()
+    render(
+      <GlobalHotkeys keyName="c" onKeyDown={onKeyDown} onKeyUp={onKeyUp}>
+        <div>content</div>
+      </GlobalHotkeys>
+    )
+
+    expect(() => {
+      document.dispatchEvent(new Event("keydown"))
+      document.dispatchEvent(new Event("keyup"))
+    }).not.toThrow()
+    expect(onKeyDown).not.toHaveBeenCalled()
+    expect(onKeyUp).not.toHaveBeenCalled()
+  })
+
   it("removes document listeners on unmount", async () => {
     const user = userEvent.setup()
     const onKeyDown = vi.fn()
